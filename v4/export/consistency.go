@@ -8,7 +8,6 @@ import (
 )
 
 func NewConsistencyController(ctx context.Context, conf *Config, session *sql.DB) (ConsistencyController, error) {
-	resolveAutoConsistency(conf)
 	conn, err := session.Conn(ctx)
 	if err != nil {
 		return nil, err
@@ -104,17 +103,3 @@ func (c *ConsistencyLockDumpingTables) TearDown(ctx context.Context) error {
 
 const showMasterStatusFieldNum = 5
 const snapshotFieldIndex = 1
-
-func resolveAutoConsistency(conf *Config) {
-	if conf.Consistency != "auto" {
-		return
-	}
-	switch conf.ServerInfo.ServerType {
-	case ServerTypeTiDB:
-		conf.Consistency = "snapshot"
-	case ServerTypeMySQL, ServerTypeMariaDB:
-		conf.Consistency = "flush"
-	default:
-		conf.Consistency = "none"
-	}
-}

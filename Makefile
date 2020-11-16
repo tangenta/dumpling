@@ -21,7 +21,7 @@ bin/%: cmd/%/main.go $(wildcard v4/**/*.go)
 	$(GO) build $(GOLDFLAGS) -tags codes -o $@ $<
 
 test: failpoint-enable
-	$(GO) list ./... | xargs $(GO) test $(GOLDFLAGS) -coverprofile=coverage.txt -covermode=atomic  ||{ $(FAILPOINT_DISABLE); exit 1; }
+	$(GO) list ./... | xargs $(GO) test $(GOLDFLAGS) -timeout 5s -coverprofile=coverage.txt -covermode=atomic  ||{ $(FAILPOINT_DISABLE); exit 1; }
 	@make failpoint-disable
 
 integration_test: failpoint-enable bin/dumpling

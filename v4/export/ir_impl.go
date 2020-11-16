@@ -4,13 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strconv"
 	"strings"
-
-	"github.com/pkg/errors"
-	"go.uber.org/zap"
-
-	"github.com/pingcap/dumpling/v4/log"
 )
 
 // rowIter implements the SQLRowIter interface.
@@ -76,20 +70,81 @@ func (m *stringIter) HasNext() bool {
 	return m.idx < len(m.ss)
 }
 
-type tableData struct {
+type tableMeta struct {
 	database        string
 	table           string
-	query           string
-	chunkIndex      int
-	rows            *sql.Rows
 	colTypes        []*sql.ColumnType
 	selectedField   string
 	specCmts        []string
-	escapeBackslash bool
+	showCreateTable string
+	showCreateView  string
+}
+
+func (tm *tableMeta) ColumnTypes() []string {
+	colTypes := make([]string, len(tm.colTypes))
+	for i, ct := range tm.colTypes {
+		colTypes[i] = ct.DatabaseTypeName()
+	}
+	return colTypes
+}
+
+func (tm *tableMeta) ColumnNames() []string {
+	colNames := make([]string, len(tm.colTypes))
+	for i, ct := range tm.colTypes {
+		colNames[i] = ct.Name()
+	}
+	return colNames
+}
+
+func (tm *tableMeta) DatabaseName() string {
+	return tm.database
+}
+
+func (tm *tableMeta) TableName() string {
+	return tm.table
+}
+
+func (tm *tableMeta) ColumnCount() uint {
+	return uint(len(tm.colTypes))
+}
+
+func (tm *tableMeta) SelectedField() string {
+	if tm.selectedField == "*" {
+		return ""
+	}
+	return fmt.Sprintf("(%s)", tm.selectedField)
+}
+
+func (tm *tableMeta) SpecialComments() StringIter {
+	return newStringIter(tm.specCmts...)
+}
+
+func (tm *tableMeta) ShowCreateTable() string {
+	return tm.showCreateTable
+}
+
+func (tm *tableMeta) ShowCreateView() string {
+	return tm.showCreateView
+}
+
+type tableData struct {
+	query  string
+	rows   *sql.Rows
+	colLen int
 	SQLRowIter
 }
 
+func newTableData(query string, colLen int) *tableData {
+	return &tableData{
+		query:  query,
+		colLen: colLen,
+	}
+}
+
 func (td *tableData) Start(ctx context.Context, conn *sql.Conn) error {
+	if td.rows != nil {
+		return nil
+	}
 	rows, err := conn.QueryContext(ctx, td.query)
 	if err != nil {
 		return err
@@ -98,280 +153,11 @@ func (td *tableData) Start(ctx context.Context, conn *sql.Conn) error {
 	return nil
 }
 
-func (td *tableData) ColumnTypes() []string {
-	colTypes := make([]string, len(td.colTypes))
-	for i, ct := range td.colTypes {
-		colTypes[i] = ct.DatabaseTypeName()
-	}
-	return colTypes
-}
-
-func (td *tableData) ColumnNames() []string {
-	colNames := make([]string, len(td.colTypes))
-	for i, ct := range td.colTypes {
-		colNames[i] = ct.Name()
-	}
-	return colNames
-}
-
-func (td *tableData) DatabaseName() string {
-	return td.database
-}
-
-func (td *tableData) TableName() string {
-	return td.table
-}
-
-func (td *tableData) ChunkIndex() int {
-	return td.chunkIndex
-}
-
-func (td *tableData) ColumnCount() uint {
-	return uint(len(td.colTypes))
-}
-
 func (td *tableData) Rows() SQLRowIter {
 	if td.SQLRowIter == nil {
-		td.SQLRowIter = newRowIter(td.rows, len(td.colTypes))
+		td.SQLRowIter = newRowIter(td.rows, td.colLen)
 	}
 	return td.SQLRowIter
-}
-
-func (td *tableData) SelectedField() string {
-	if td.selectedField == "*" {
-		return ""
-	}
-	return fmt.Sprintf("(%s)", td.selectedField)
-}
-
-func (td *tableData) SpecialComments() StringIter {
-	return newStringIter(td.specCmts...)
-}
-
-func (td *tableData) EscapeBackSlash() bool {
-	return td.escapeBackslash
-}
-
-func splitTableDataIntoChunks(
-	ctx context.Context,
-	tableDataIRCh chan TableDataIR,
-	errCh chan error,
-	linear chan struct{},
-	dbName, tableName string, db *sql.Conn, conf *Config) {
-	if conf.ChunkByTiDBRegion {
-		// Try to get the TiDB region start keys.
-		_, err := db.ExecContext(context.Background(), fmt.Sprintf("USE %s;", dbName))
-		if err != nil {
-			errCh <- withStack(err)
-			return
-		}
-		regionStartKeys := GetTiDBRegionStartKeys(db, dbName, tableName)
-		cutOffPoints := DecodeTiDBClusteredRegionKeysToJSON(db, regionStartKeys)
-		if len(cutOffPoints) != 0 {
-			splitTiDBClusteredIndexTableIntoChunks(ctx, tableDataIRCh, errCh, cutOffPoints, dbName, tableName, db, conf)
-			return
-		}
-		log.Debug("no valid region start key found",
-			zap.String("database", dbName), zap.String("table", tableName))
-		linear <- struct{}{}
-		return
-	}
-	field, err := pickupPossibleField(dbName, tableName, db, conf)
-	if err != nil {
-		errCh <- withStack(err)
-		return
-	}
-	if field == "" {
-		// skip split chunk logic if not found proper field
-		log.Debug("skip concurrent dump due to no proper field", zap.String("field", field))
-		linear <- struct{}{}
-		return
-	}
-
-	query := fmt.Sprintf("SELECT MIN(`%s`),MAX(`%s`) FROM `%s`.`%s` ",
-		escapeString(field), escapeString(field), escapeString(dbName), escapeString(tableName))
-	if conf.Where != "" {
-		query = fmt.Sprintf("%s WHERE %s", query, conf.Where)
-	}
-	log.Debug("split chunks", zap.String("query", query))
-
-	var smin sql.NullString
-	var smax sql.NullString
-	row := db.QueryRowContext(ctx, query)
-	err = row.Scan(&smin, &smax)
-	if err != nil {
-		log.Error("split chunks - get max min failed", zap.String("query", query), zap.Error(err))
-		errCh <- withStack(err)
-		return
-	}
-	if !smax.Valid || !smin.Valid {
-		// found no data
-		log.Warn("no data to dump", zap.String("schema", dbName), zap.String("table", tableName))
-		close(tableDataIRCh)
-		return
-	}
-
-	var max uint64
-	var min uint64
-	if max, err = strconv.ParseUint(smax.String, 10, 64); err != nil {
-		errCh <- errors.WithMessagef(err, "fail to convert max value %s in query %s", smax.String, query)
-		return
-	}
-	if min, err = strconv.ParseUint(smin.String, 10, 64); err != nil {
-		errCh <- errors.WithMessagef(err, "fail to convert min value %s in query %s", smin.String, query)
-		return
-	}
-
-	count := estimateCount(dbName, tableName, db, field, conf)
-	log.Info("get estimated rows count", zap.Uint64("estimateCount", count))
-	if count < conf.Rows {
-		// skip chunk logic if estimates are low
-		log.Debug("skip concurrent dump due to estimate count < rows",
-			zap.Uint64("estimate count", count),
-			zap.Uint64("conf.rows", conf.Rows),
-		)
-		linear <- struct{}{}
-		return
-	}
-
-	// every chunk would have eventual adjustments
-	estimatedChunks := count / conf.Rows
-	estimatedStep := (max-min)/estimatedChunks + 1
-	cutoff := min
-
-	selectedField, err := buildSelectField(db, dbName, tableName, conf.CompleteInsert)
-	if err != nil {
-		errCh <- withStack(err)
-		return
-	}
-
-	colTypes, err := GetColumnTypes(db, selectedField, dbName, tableName)
-	if err != nil {
-		errCh <- withStack(err)
-		return
-	}
-	orderByClause, err := buildOrderByClause(conf, db, dbName, tableName)
-	if err != nil {
-		errCh <- withStack(err)
-		return
-	}
-
-	chunkIndex := 0
-	nullValueCondition := fmt.Sprintf("`%s` IS NULL OR ", escapeString(field))
-LOOP:
-	for cutoff <= max {
-		chunkIndex += 1
-		where := fmt.Sprintf("%s(`%s` >= %d AND `%s` < %d)", nullValueCondition, escapeString(field), cutoff, escapeString(field), cutoff+estimatedStep)
-		query = buildSelectQuery(dbName, tableName, selectedField, buildWhereCondition(conf, where), orderByClause)
-		if len(nullValueCondition) > 0 {
-			nullValueCondition = ""
-		}
-
-		td := &tableData{
-			database:        dbName,
-			table:           tableName,
-			query:           query,
-			chunkIndex:      chunkIndex,
-			colTypes:        colTypes,
-			selectedField:   selectedField,
-			escapeBackslash: conf.EscapeBackslash,
-			specCmts: []string{
-				"/*!40101 SET NAMES binary*/;",
-			},
-		}
-		cutoff += estimatedStep
-		select {
-		case <-ctx.Done():
-			break LOOP
-		case tableDataIRCh <- td:
-		}
-	}
-	close(tableDataIRCh)
-}
-
-func splitTiDBClusteredIndexTableIntoChunks(ctx context.Context,
-	tableDataIRCh chan TableDataIR,
-	errCh chan error,
-	cutOffPoints []map[string]interface{},
-	dbName, tableName string, db *sql.Conn, conf *Config) {
-	selectedField, err := buildSelectField(db, dbName, tableName, conf.CompleteInsert)
-	if err != nil {
-		errCh <- withStack(err)
-		return
-	}
-	colTypes, err := GetColumnTypes(db, selectedField, dbName, tableName)
-	if err != nil {
-		errCh <- withStack(err)
-		return
-	}
-	orderByClause, err := buildOrderByClause(conf, db, dbName, tableName)
-	if err != nil {
-		errCh <- withStack(err)
-		return
-	}
-	where, err := buildTiDBChunkByRegionWhereCondition(cutOffPoints)
-	if err != nil {
-		errCh <- withStack(err)
-		return
-	}
-	for i, w := range where {
-		query := buildSelectQuery(dbName, tableName, selectedField, buildWhereCondition(conf, w), orderByClause)
-		td := &tableData{
-			database:        dbName,
-			table:           tableName,
-			query:           query,
-			chunkIndex:      i,
-			colTypes:        colTypes,
-			selectedField:   selectedField,
-			escapeBackslash: conf.EscapeBackslash,
-			specCmts: []string{
-				"/*!40101 SET NAMES binary*/;",
-			},
-		}
-		contextDone := false
-		select {
-		case <-ctx.Done():
-			contextDone = true
-		case tableDataIRCh <- td:
-		}
-		if contextDone {
-			break
-		}
-	}
-	close(tableDataIRCh)
-	return
-}
-
-func buildTiDBChunkByRegionWhereCondition(cutOffPoints []map[string]interface{}) ([]string, error) {
-	var whereFields []string
-	for colName := range cutOffPoints[0]["handle"].(map[string]interface{}) {
-		whereFields = append(whereFields, colName)
-	}
-	whereFieldsStr := strings.Join(whereFields, ", ")
-	whereValuesStrs := make([]string, 0, len(cutOffPoints))
-	for _, cutOff := range cutOffPoints {
-		colsVal := cutOff["handle"].(map[string]interface{})
-		whereValues := make([]string, 0, len(whereFields))
-		for _, wf := range whereFields {
-			switch v := colsVal[wf].(type) {
-			case int:
-				whereValues = append(whereValues, fmt.Sprintf("%d", v))
-			case string:
-				whereValues = append(whereValues, wrapStringWith(v, `'`))
-			default:
-				return nil, withStack(errors.Errorf("unsupported column type"))
-			}
-		}
-		whereValuesStrs = append(whereValuesStrs, strings.Join(whereValues, ", "))
-	}
-	where := make([]string, 0, len(whereValuesStrs)+1)
-	where = append(where, fmt.Sprintf("(%s) < (%s)", whereFieldsStr, whereValuesStrs[0]))
-	for i := 1; i < len(whereValuesStrs); i++ {
-		low, up := whereValuesStrs[i-1], whereValuesStrs[i]
-		where = append(where, fmt.Sprintf("(%s) < (%s) AND (%s) >= (%s)", whereFieldsStr, low, whereFieldsStr, up))
-	}
-	where = append(where, fmt.Sprintf("(%s) >= (%s)", whereFieldsStr, whereValuesStrs[len(whereValuesStrs)-1]))
-	return where, nil
 }
 
 type metaData struct {

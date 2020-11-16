@@ -74,7 +74,6 @@ var (
 	escapeBackslash      bool
 	tidbMemQuotaQuery    uint64
 	outputFilenameFormat string
-	chunkByTiDBRegion    bool
 )
 
 var defaultOutputDir = timestampDirName()
@@ -128,7 +127,6 @@ func main() {
 	pflag.StringVar(&csvDelimiter, "csv-delimiter", "\"", "The delimiter for values in csv files, default '\"'")
 	pflag.StringVar(&outputFilenameFormat, "output-filename-template", "", "The output filename template (without file extension)")
 	pflag.BoolVar(&completeInsert, "complete-insert", false, "Use complete INSERT statements that include column names")
-	pflag.BoolVar(&chunkByTiDBRegion, "chunk-by-tidb-region", false, "Whether to dump TiDB regions by parallel. Only available when the server is TiDB.")
 
 	storage.DefineFlags(pflag.CommandLine)
 
@@ -215,7 +213,6 @@ func main() {
 	conf.CsvDelimiter = csvDelimiter
 	conf.OutputFileTemplate = tmpl
 	conf.CompleteInsert = completeInsert
-	conf.ChunkByTiDBRegion = chunkByTiDBRegion
 
 	err = conf.ParseFromFlags(pflag.CommandLine)
 	if err != nil {
@@ -223,12 +220,27 @@ func main() {
 		os.Exit(2)
 	}
 
-	err = export.Dump(context.Background(), conf)
+	cr := export.NewConfigResolver(context.Background())
+	err = cr.ResolveConfig(conf)
+	if err != nil {
+		log.Error("ResolveConfig failed error stack info", zap.Error(err))
+		fmt.Printf("\ndump failed: %s\n", err.Error())
+		os.Exit(1)
+	}
+
+	dumper, err := export.NewDumper(context.Background(), conf)
+	if err != nil {
+		log.Error("NewDumper failed error stack info", zap.Error(err))
+		fmt.Printf("\ndump failed: %s\n", err.Error())
+		os.Exit(1)
+	}
+	err = dumper.Dump()
 	if err != nil {
 		log.Error("dump failed error stack info", zap.Error(err))
 		fmt.Printf("\ndump failed: %s\n", err.Error())
 		os.Exit(1)
 	} else {
+		_ = dumper.Close()
 		log.Info("dump data successfully, dumpling will exit now")
 	}
 }

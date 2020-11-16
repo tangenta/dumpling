@@ -7,19 +7,23 @@ import (
 )
 
 // TableDataIR is table data intermediate representation.
+// A table may be split into multiple TableDataIRs.
 type TableDataIR interface {
 	Start(context.Context, *sql.Conn) error
+	Rows() SQLRowIter
+}
+
+// TableMeta contains the meta information of a table.
+type TableMeta interface {
 	DatabaseName() string
 	TableName() string
-	ChunkIndex() int
 	ColumnCount() uint
 	ColumnTypes() []string
 	ColumnNames() []string
 	SelectedField() string
-	EscapeBackSlash() bool
-
 	SpecialComments() StringIter
-	Rows() SQLRowIter
+	ShowCreateTable() string
+	ShowCreateView() string
 }
 
 // SQLRowIter is the iterator on a collection of sql.Row.

@@ -39,24 +39,23 @@ type Config struct {
 	LogFormat string
 	Logger    *zap.Logger `json:"-"`
 
-	FileSize          uint64
-	StatementSize     uint64
-	OutputDirPath     string
-	ServerInfo        ServerInfo
-	SortByPk          bool
-	Tables            DatabaseTables
-	StatusAddr        string
-	Snapshot          string
-	Consistency       string
-	NoViews           bool
-	NoHeader          bool
-	NoSchemas         bool
-	NoData            bool
-	CsvNullValue      string
-	Sql               string
-	CsvSeparator      string
-	CsvDelimiter      string
-	ChunkByTiDBRegion bool
+	FileSize      uint64
+	StatementSize uint64
+	OutputDirPath string
+	ServerInfo    ServerInfo
+	SortByPk      bool
+	Tables        DatabaseTables
+	StatusAddr    string
+	Snapshot      string
+	Consistency   string
+	NoViews       bool
+	NoHeader      bool
+	NoSchemas     bool
+	NoData        bool
+	CsvNullValue  string
+	Sql           string
+	CsvSeparator  string
+	CsvDelimiter  string
 
 	TableFilter        filter.Filter `json:"-"`
 	Rows               uint64
@@ -69,8 +68,6 @@ type Config struct {
 	SessionParams      map[string]interface{}
 
 	PosAfterConnect bool
-
-	ExternalStorage storage.ExternalStorage `json:"-"`
 }
 
 func DefaultConfig() *Config {
@@ -148,6 +145,7 @@ const (
 )
 
 var gcSafePointVersion, _ = semver.NewVersion("4.0.0")
+var tableSampleVersion, _ = semver.NewVersion("4.0.9")
 
 type ServerInfo struct {
 	ServerType    ServerType
@@ -181,7 +179,11 @@ func ParseServerInfo(src string) ServerInfo {
 
 	var versionStr string
 	if serverInfo.ServerType == ServerTypeTiDB {
-		versionStr = tidbVersionRegex.FindString(src)[1:]
+		versionStr = tidbVersionRegex.FindString(src)
+		if len(versionStr) > 0 {
+			// Trim the beginning "v".
+			versionStr = versionStr[1:]
+		}
 	} else {
 		versionStr = versionRegex.FindString(src)
 	}

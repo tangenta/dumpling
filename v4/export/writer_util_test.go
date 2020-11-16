@@ -25,7 +25,8 @@ type testUtilSuite struct {
 
 func (s *testUtilSuite) SetUpSuite(c *C) {
 	s.mockCfg = &Config{
-		FileSize: UnspecifiedSize,
+		FileSize:      UnspecifiedSize,
+		StatementSize: UnspecifiedSize,
 	}
 }
 
@@ -61,7 +62,7 @@ func (s *testUtilSuite) TestWriteInsert(c *C) {
 	tableIR := newMockTableIR("test", "employee", data, specCmts, colTypes)
 	bf := storage.NewBufferWriter()
 
-	err := WriteInsert(context.Background(), tableIR, bf, UnspecifiedSize, UnspecifiedSize)
+	err := WriteInsert(context.Background(), s.mockCfg, tableIR, tableIR, bf)
 	c.Assert(err, IsNil)
 	expected := "/*!40101 SET NAMES binary*/;\n" +
 		"/*!40014 SET FOREIGN_KEY_CHECKS=0*/;\n" +
@@ -91,7 +92,7 @@ func (s *testUtilSuite) TestWriteInsertReturnsError(c *C) {
 	tableIR.rowErr = rowErr
 	bf := storage.NewBufferWriter()
 
-	err := WriteInsert(context.Background(), tableIR, bf, UnspecifiedSize, UnspecifiedSize)
+	err := WriteInsert(context.Background(), s.mockCfg, tableIR, tableIR, bf)
 	c.Assert(err, Equals, rowErr)
 	expected := "/*!40101 SET NAMES binary*/;\n" +
 		"/*!40014 SET FOREIGN_KEY_CHECKS=0*/;\n" +
@@ -112,10 +113,14 @@ func (s *testUtilSuite) TestWriteInsertInCsv(c *C) {
 	colTypes := []string{"INT", "SET", "VARCHAR", "VARCHAR", "TEXT"}
 	tableIR := newMockTableIR("test", "employee", data, nil, colTypes)
 	bf := storage.NewBufferWriter()
+	mockCfg := *s.mockCfg
+	mockCfg.NoHeader = true
+	mockCfg.CsvSeparator = ","
+	mockCfg.CsvDelimiter = `"`
+	mockCfg.CsvNullValue = "\\N"
 
 	// test nullValue
-	opt := &csvOption{separator: []byte(","), delimiter: doubleQuotationMark, nullValue: "\\N"}
-	err := WriteInsertInCsv(context.Background(), tableIR, bf, true, opt, UnspecifiedSize)
+	err := WriteInsertInCsv(context.Background(), &mockCfg, tableIR, tableIR, bf)
 	c.Assert(err, IsNil)
 	expected := "1,\"male\",\"bob@mail.com\",\"020-1234\",\\N\n" +
 		"2,\"female\",\"sarah@mail.com\",\"020-1253\",\"healthy\"\n" +
@@ -125,9 +130,9 @@ func (s *testUtilSuite) TestWriteInsertInCsv(c *C) {
 
 	// test delimiter
 	bf.Reset()
-	opt.delimiter = quotationMark
+	mockCfg.CsvDelimiter = `'`
 	tableIR = newMockTableIR("test", "employee", data, nil, colTypes)
-	err = WriteInsertInCsv(context.Background(), tableIR, bf, true, opt, UnspecifiedSize)
+	err = WriteInsertInCsv(context.Background(), &mockCfg, tableIR, tableIR, bf)
 	c.Assert(err, IsNil)
 	expected = "1,'male','bob@mail.com','020-1234',\\N\n" +
 		"2,'female','sarah@mail.com','020-1253','healthy'\n" +
@@ -137,9 +142,9 @@ func (s *testUtilSuite) TestWriteInsertInCsv(c *C) {
 
 	// test separator
 	bf.Reset()
-	opt.separator = []byte(";")
+	mockCfg.CsvSeparator = ";"
 	tableIR = newMockTableIR("test", "employee", data, nil, colTypes)
-	err = WriteInsertInCsv(context.Background(), tableIR, bf, true, opt, UnspecifiedSize)
+	err = WriteInsertInCsv(context.Background(), &mockCfg, tableIR, tableIR, bf)
 	c.Assert(err, IsNil)
 	expected = "1;'male';'bob@mail.com';'020-1234';\\N\n" +
 		"2;'female';'sarah@mail.com';'020-1253';'healthy'\n" +
@@ -149,11 +154,12 @@ func (s *testUtilSuite) TestWriteInsertInCsv(c *C) {
 
 	// test delimiter that included in values
 	bf.Reset()
-	opt.separator = []byte("&;,?")
-	opt.delimiter = []byte("ma")
+	mockCfg.CsvSeparator = "&;,?"
+	mockCfg.CsvDelimiter = "ma"
 	tableIR = newMockTableIR("test", "employee", data, nil, colTypes)
+	mockCfg.NoHeader = false
 	tableIR.colNames = []string{"id", "gender", "email", "phone_number", "status"}
-	err = WriteInsertInCsv(context.Background(), tableIR, bf, false, opt, UnspecifiedSize)
+	err = WriteInsertInCsv(context.Background(), &mockCfg, tableIR, tableIR, bf)
 	c.Assert(err, IsNil)
 	expected = "maidma&;,?magenderma&;,?maemamailma&;,?maphone_numberma&;,?mastatusma\n" +
 		"1&;,?mamamalema&;,?mabob@mamail.comma&;,?ma020-1234ma&;,?\\N\n" +
@@ -178,7 +184,7 @@ func (s *testUtilSuite) TestSQLDataTypes(c *C) {
 		tableIR := newMockTableIR("test", "t", tableData, nil, colType)
 		bf := storage.NewBufferWriter()
 
-		err := WriteInsert(context.Background(), tableIR, bf, UnspecifiedSize, UnspecifiedSize)
+		err := WriteInsert(context.Background(), s.mockCfg, tableIR, tableIR, bf)
 		c.Assert(err, IsNil)
 		lines := strings.Split(bf.String(), "\n")
 		c.Assert(len(lines), Equals, 3)

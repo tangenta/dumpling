@@ -3,7 +3,6 @@ package export
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -189,13 +188,48 @@ func SelectVersion(db *sql.DB) (string, error) {
 	return versionInfo, nil
 }
 
-func SelectAllFromTable(conf *Config, db *sql.Conn, database, table string) (TableDataIR, error) {
-	selectedField, err := buildSelectField(db, database, table, conf.CompleteInsert)
+func dumpTableMeta(conf *Config, conn *sql.Conn, db string, table *TableInfo) (TableMeta, error) {
+	tbl := table.Name
+	selectField, _, err := buildSelectField(conn, db, tbl, conf.CompleteInsert)
 	if err != nil {
 		return nil, err
 	}
 
-	colTypes, err := GetColumnTypes(db, selectedField, database, table)
+	colTypes, err := GetColumnTypes(conn, selectField, db, tbl)
+	if err != nil {
+		return nil, err
+	}
+
+	meta := &tableMeta{
+		database:      db,
+		table:         tbl,
+		colTypes:      colTypes,
+		selectedField: selectField,
+		specCmts: []string{
+			"/*!40101 SET NAMES binary*/;",
+		},
+	}
+
+	if conf.NoSchemas {
+		return meta, nil
+	}
+	if table.Type == TableTypeView {
+		viewName := table.Name
+		createTableSQL, createViewSQL, err := ShowCreateView(conn, db, viewName)
+		if err != nil {
+			return meta, err
+		}
+		meta.showCreateTable = createTableSQL
+		meta.showCreateView = createViewSQL
+		return meta, nil
+	}
+	createTableSQL, err := ShowCreateTable(conn, db, tbl)
+	meta.showCreateTable = createTableSQL
+	return meta, nil
+}
+
+func SelectAllFromTable(conf *Config, db *sql.Conn, database, table string) (TableDataIR, error) {
+	selectField, selectLen, err := buildSelectField(db, database, table, conf.CompleteInsert)
 	if err != nil {
 		return nil, err
 	}
@@ -205,49 +239,46 @@ func SelectAllFromTable(conf *Config, db *sql.Conn, database, table string) (Tab
 		return nil, err
 	}
 
-	query := buildSelectQuery(database, table, selectedField, buildWhereCondition(conf, ""), orderByClause)
+	query := buildSelectQuery(database, table, selectField, buildWhereCondition(conf, ""), orderByClause)
 
 	return &tableData{
-		database:        database,
-		table:           table,
-		query:           query,
-		colTypes:        colTypes,
-		selectedField:   selectedField,
-		escapeBackslash: conf.EscapeBackslash,
-		specCmts: []string{
-			"/*!40101 SET NAMES binary*/;",
-		},
+		query:  query,
+		colLen: selectLen,
 	}, nil
 }
 
-func SelectFromSql(conf *Config, db *sql.Conn) (TableDataIR, error) {
+func SelectFromSql(conf *Config, conn *sql.Conn) (TableMeta, TableDataIR, error) {
 	log.Info("dump data from sql", zap.String("sql", conf.Sql))
-	rows, err := db.QueryContext(context.Background(), conf.Sql)
+	rows, err := conn.QueryContext(context.Background(), conf.Sql)
 	if err != nil {
-		return nil, withStack(errors.WithMessage(err, conf.Sql))
+		return nil, nil, withStack(errors.WithMessage(err, conf.Sql))
 	}
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		return nil, withStack(errors.WithMessage(err, conf.Sql))
+		return nil, nil, withStack(errors.WithMessage(err, conf.Sql))
 	}
 	cols, err := rows.Columns()
 	if err != nil {
-		return nil, withStack(errors.WithMessage(err, conf.Sql))
+		return nil, nil, withStack(errors.WithMessage(err, conf.Sql))
 	}
 	for i := range cols {
 		cols[i] = wrapBackTicks(cols[i])
 	}
-	return &tableData{
-		database:        "",
-		table:           "",
-		rows:            rows,
-		colTypes:        colTypes,
-		selectedField:   strings.Join(cols, ","),
-		escapeBackslash: conf.EscapeBackslash,
+	meta := &tableMeta{
+		colTypes:      colTypes,
+		selectedField: strings.Join(cols, ","),
 		specCmts: []string{
 			"/*!40101 SET NAMES binary*/;",
 		},
-	}, nil
+	}
+	data := &tableData{
+		query:      conf.Sql,
+		rows:       rows,
+		colLen:     len(cols),
+		SQLRowIter: nil,
+	}
+
+	return meta, data, nil
 }
 
 func buildSelectQuery(database, table string, fields string, where string, orderByClause string) string {
@@ -278,13 +309,6 @@ func buildOrderByClause(conf *Config, db *sql.Conn, database, table string) (str
 		return "", nil
 	}
 	if conf.ServerInfo.ServerType == ServerTypeTiDB {
-		if conf.ChunkByTiDBRegion {
-			allPks, err := GetAllPrimaryKeyName(db, database, table)
-			if err != nil {
-				return "", withStack(err)
-			}
-			return fmt.Sprintf("ORDER BY %s", strings.Join(allPks, ", ")), nil
-		}
 		ok, err := SelectTiDBRowID(db, database, table)
 		if err != nil {
 			return "", withStack(err)
@@ -295,13 +319,16 @@ func buildOrderByClause(conf *Config, db *sql.Conn, database, table string) (str
 			return "", nil
 		}
 	}
-	pkName, err := GetPrimaryKeyName(db, database, table)
+	pkNames, err := GetPrimaryKeyName(db, database, table)
 	if err != nil {
 		return "", withStack(err)
 	}
-	tableContainsPriKey := pkName != ""
+	tableContainsPriKey := len(pkNames) != 0
 	if tableContainsPriKey {
-		return fmt.Sprintf("ORDER BY `%s`", escapeString(pkName)), nil
+		for i := range pkNames {
+			pkNames[i] = fmt.Sprintf("`%s`", escapeString(pkNames[i]))
+		}
+		return fmt.Sprintf("ORDER BY %s", strings.Join(pkNames, ",")), nil
 	}
 	return "", nil
 }
@@ -330,33 +357,23 @@ func GetColumnTypes(db *sql.Conn, fields, database, table string) ([]*sql.Column
 	return rows.ColumnTypes()
 }
 
-func GetPrimaryKeyName(db *sql.Conn, database, table string) (string, error) {
+func GetPrimaryKeyName(db *sql.Conn, database, table string) ([]string, error) {
 	priKeyQuery := "SELECT column_name FROM information_schema.columns " +
 		"WHERE table_schema = ? AND table_name = ? AND column_key = 'PRI';"
-	var colName string
-	row := db.QueryRowContext(context.Background(), priKeyQuery, database, table)
-	if err := row.Scan(&colName); err != nil {
-		if err == sql.ErrNoRows {
-			return "", nil
-		} else {
-			return "", withStack(errors.WithMessage(err, priKeyQuery))
-		}
-	}
-	return colName, nil
-}
-
-func GetAllPrimaryKeyName(db *sql.Conn, database, table string) ([]string, error) {
-	priKeyQuery := "SELECT column_name FROM information_schema.columns " +
-		"WHERE table_schema = ? AND table_name = ? AND column_key = 'PRI';"
+	var colNames []string
 	rows, err := db.QueryContext(context.Background(), priKeyQuery, database, table)
 	if err != nil {
 		return nil, withStack(errors.WithMessage(err, priKeyQuery))
 	}
-	ret, err := GetSpecifiedColumnValue(rows, "COLUMN_NAME")
-	if err != nil {
-		return nil, withStack(errors.WithMessage(err, priKeyQuery))
+	defer rows.Close()
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, withStack(errors.WithMessage(err, priKeyQuery))
+		}
+		colNames = append(colNames, s)
 	}
-	return ret, nil
+	return colNames, nil
 }
 
 func GetUniqueIndexName(db *sql.Conn, database, table string) (string, error) {
@@ -463,41 +480,6 @@ func GetTiDBDDLIDs(db *sql.DB) ([]string, error) {
 	return GetSpecifiedColumnValue(rows, "DDL_ID")
 }
 
-func DecodeTiDBClusteredRegionKeysToJSON(db *sql.Conn, regionKeys []string) []map[string]interface{} {
-	query := fmt.Sprintf("SELECT tidb_decode_key(?);")
-	var ret []map[string]interface{}
-	for _, key := range regionKeys {
-		var decodeResult string
-		err := simpleQueryWithArgs(db, func(rows *sql.Rows) error {
-			return rows.Scan(&decodeResult)
-		}, query, key)
-		if err != nil || key == decodeResult {
-			log.Info("unable to decode region key, skip", zap.String("key", key))
-			continue
-		}
-		var js map[string]interface{}
-		err = json.Unmarshal([]byte(decodeResult), &js)
-		if err != nil {
-			log.Warn("unable to unmarshal json when decoding TiDB region key, skip",
-				zap.String("key", key), zap.String("decode result", decodeResult))
-			continue
-		}
-		switch v := js["handle"].(type) {
-		case string:
-			// table id not found, fallback to old method.
-			log.Warn("unable to decode the origin value when decoding TiDB region key, skip",
-				zap.String("key", key), zap.String("decode result", decodeResult), zap.String("handle", v))
-			continue
-		case map[string]interface{}:
-		default:
-			log.Warn("unexpected json value type when decoding TiDB region key",
-				zap.String("key", key), zap.String("decode result", decodeResult), zap.Any("handle", v))
-		}
-		ret = append(ret, js)
-	}
-	return ret
-}
-
 func GetTiDBRegionStartKeys(db *sql.Conn, dbName, tableName string) []string {
 	query := "SELECT start_key FROM information_schema.tikv_region_status s, information_schema.tables t " +
 		"WHERE s.table_id = t.tidb_table_id AND s.db_name = ? AND t.table_name = ? AND is_index = 0 ORDER BY start_key;"
@@ -593,11 +575,11 @@ func createConnWithConsistency(ctx context.Context, db *sql.DB) (*sql.Conn, erro
 	return conn, nil
 }
 
-func buildSelectField(db *sql.Conn, dbName, tableName string, completeInsert bool) (string, error) {
+func buildSelectField(db *sql.Conn, dbName, tableName string, completeInsert bool) (string, int, error) {
 	query := `SELECT COLUMN_NAME,EXTRA FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=?;`
 	rows, err := db.QueryContext(context.Background(), query, dbName, tableName)
 	if err != nil {
-		return "", withStack(errors.WithMessage(err, query))
+		return "", 0, withStack(errors.WithMessage(err, query))
 	}
 	defer rows.Close()
 	availableFields := make([]string, 0)
@@ -608,7 +590,7 @@ func buildSelectField(db *sql.Conn, dbName, tableName string, completeInsert boo
 	for rows.Next() {
 		err = rows.Scan(&fieldName, &extra)
 		if err != nil {
-			return "", withStack(errors.WithMessage(err, query))
+			return "", 0, withStack(errors.WithMessage(err, query))
 		}
 		switch extra {
 		case "STORED GENERATED", "VIRTUAL GENERATED":
@@ -618,9 +600,9 @@ func buildSelectField(db *sql.Conn, dbName, tableName string, completeInsert boo
 		availableFields = append(availableFields, wrapBackTicks(escapeString(fieldName)))
 	}
 	if completeInsert || hasGenerateColumn {
-		return strings.Join(availableFields, ","), nil
+		return strings.Join(availableFields, ","), len(availableFields), nil
 	}
-	return "*", nil
+	return "*", len(availableFields), nil
 }
 
 type oneStrColumnTable struct {
@@ -657,6 +639,47 @@ func simpleQueryWithArgs(conn *sql.Conn, handleOneRow func(*sql.Rows) error, sql
 	return rows.Err()
 }
 
+func selectTiDBTableSample(dbName, tableName string, db *sql.Conn) (pkNames string, pkVals []string, err error) {
+	pkFields, err := GetPrimaryKeyName(db, dbName, tableName)
+	if err != nil {
+		return "", nil, err
+	}
+	var query string
+	if len(pkFields) == 0 {
+		template := "SELECT `_tidb_rowid` FROM `%s`.`%s` TABLESAMPLE REGIONS() ORDER BY `_tidb_rowid`"
+		query = fmt.Sprintf(template, dbName, tableName)
+	} else {
+		for i := range pkFields {
+			pkFields[i] = fmt.Sprintf("`%s`", escapeString(pkFields[i]))
+		}
+		pkNames = strings.Join(pkFields, ",")
+		template := "SELECT %s FROM `%s`.`%s` TABLESAMPLE REGIONS() ORDER BY %s"
+		query = fmt.Sprintf(template, pkNames, dbName, tableName, pkNames)
+	}
+	rows, err := db.QueryContext(context.Background(), query)
+	if err != nil {
+		return "", nil, withStack(errors.WithMessage(err, query))
+	}
+	defer rows.Close()
+
+	cols := make([]string, len(pkFields))
+	colRefs := make([]*string, len(pkFields))
+	for i := range cols {
+		colRefs[i] = &cols[i]
+	}
+	for rows.Next() {
+		err = rows.Scan(colRefs)
+		if err != nil {
+			return "", nil, withStack(errors.WithMessage(err, query))
+		}
+		for i := range cols {
+			cols[i] = fmt.Sprintf("%s", escapeString(cols[i]))
+		}
+		pkVals = append(pkVals, strings.Join(cols, ","))
+	}
+	return pkNames, pkVals, nil
+}
+
 func pickupPossibleField(dbName, tableName string, db *sql.Conn, conf *Config) (string, error) {
 	// If detected server is TiDB, try using _tidb_rowid
 	if conf.ServerInfo.ServerType == ServerTypeTiDB {
@@ -669,27 +692,28 @@ func pickupPossibleField(dbName, tableName string, db *sql.Conn, conf *Config) (
 		}
 	}
 	// try to use pk
-	fieldName, err := GetPrimaryKeyName(db, dbName, tableName)
+	fieldNames, err := GetPrimaryKeyName(db, dbName, tableName)
 	if err != nil {
 		return "", err
 	}
 	// try to use first uniqueIndex
-	if fieldName == "" {
-		fieldName, err = GetUniqueIndexName(db, dbName, tableName)
+	if len(fieldNames) == 0 {
+		n, err := GetUniqueIndexName(db, dbName, tableName)
 		if err != nil {
 			return "", err
 		}
+		fieldNames = []string{n}
 	}
 
 	// there is no proper index
-	if fieldName == "" {
+	if len(fieldNames) == 0 {
 		return "", nil
 	}
 
 	query := "SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS " +
 		"WHERE TABLE_NAME = ? AND COLUMN_NAME = ?"
 	var fieldType string
-	row := db.QueryRowContext(context.Background(), query, tableName, fieldName)
+	row := db.QueryRowContext(context.Background(), query, tableName, fieldNames[0])
 	err = row.Scan(&fieldType)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -700,7 +724,7 @@ func pickupPossibleField(dbName, tableName string, db *sql.Conn, conf *Config) (
 	}
 	switch strings.ToLower(fieldType) {
 	case "int", "bigint":
-		return fieldName, nil
+		return fieldNames[0], nil
 	}
 	return "", nil
 }

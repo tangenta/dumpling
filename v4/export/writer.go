@@ -3,6 +3,7 @@ package export
 import (
 	"bytes"
 	"context"
+	"strings"
 	"text/template"
 
 	"github.com/pingcap/br/pkg/storage"
@@ -15,35 +16,48 @@ type Writer interface {
 	WriteDatabaseMeta(ctx context.Context, db, createSQL string) error
 	WriteTableMeta(ctx context.Context, db, table, createSQL string) error
 	WriteViewMeta(ctx context.Context, db, table, createTableSQL, createViewSQL string) error
-	WriteTableData(ctx context.Context, ir TableDataIR) error
+	WriteTableData(ctx context.Context, meta TableMeta, irStream <-chan TableDataIR) error
 }
 
-type SimpleWriter struct {
-	cfg *Config
+type FileWriter struct {
+	cfg        *Config
+	cntPool    *connectionsPool
+	fileFmt    FileFormat
+	extStorage storage.ExternalStorage
 }
 
-func NewSimpleWriter(config *Config) (SimpleWriter, error) {
-	sw := SimpleWriter{cfg: config}
-	return sw, nil
+func NewFileWriter(config *Config, pool *connectionsPool, externalStore storage.ExternalStorage) *FileWriter {
+	sw := &FileWriter{
+		cfg:        config,
+		cntPool:    pool,
+		extStorage: externalStore,
+	}
+	switch strings.ToLower(config.FileType) {
+	case "sql":
+		sw.fileFmt = FileFormatSQLText
+	case "csv":
+		sw.fileFmt = FileFormatCSV
+	}
+	return sw
 }
 
-func (f SimpleWriter) WriteDatabaseMeta(ctx context.Context, db, createSQL string) error {
+func (f *FileWriter) WriteDatabaseMeta(ctx context.Context, db, createSQL string) error {
 	fileName, err := (&outputFileNamer{DB: db}).render(f.cfg.OutputFileTemplate, outputFileTemplateSchema)
 	if err != nil {
 		return err
 	}
-	return writeMetaToFile(ctx, db, createSQL, f.cfg.ExternalStorage, fileName+".sql")
+	return f.writeMetaToFile(ctx, db, createSQL, fileName+".sql")
 }
 
-func (f SimpleWriter) WriteTableMeta(ctx context.Context, db, table, createSQL string) error {
+func (f *FileWriter) WriteTableMeta(ctx context.Context, db, table, createSQL string) error {
 	fileName, err := (&outputFileNamer{DB: db, Table: table}).render(f.cfg.OutputFileTemplate, outputFileTemplateTable)
 	if err != nil {
 		return err
 	}
-	return writeMetaToFile(ctx, db, createSQL, f.cfg.ExternalStorage, fileName+".sql")
+	return f.writeMetaToFile(ctx, db, createSQL, fileName+".sql")
 }
 
-func (f SimpleWriter) WriteViewMeta(ctx context.Context, db, view, createTableSQL, createViewSQL string) error {
+func (f *FileWriter) WriteViewMeta(ctx context.Context, db, view, createTableSQL, createViewSQL string) error {
 	fileNameTable, err := (&outputFileNamer{DB: db, Table: view}).render(f.cfg.OutputFileTemplate, outputFileTemplateTable)
 	if err != nil {
 		return err
@@ -52,38 +66,65 @@ func (f SimpleWriter) WriteViewMeta(ctx context.Context, db, view, createTableSQ
 	if err != nil {
 		return err
 	}
-	err = writeMetaToFile(ctx, db, createTableSQL, f.cfg.ExternalStorage, fileNameTable+".sql")
+	err = f.writeMetaToFile(ctx, db, createTableSQL, fileNameTable+".sql")
 	if err != nil {
 		return err
 	}
-	return writeMetaToFile(ctx, db, createViewSQL, f.cfg.ExternalStorage, fileNameView+".sql")
+	return f.writeMetaToFile(ctx, db, createViewSQL, fileNameView+".sql")
 }
 
-type SQLWriter struct{ SimpleWriter }
-
-func (f SQLWriter) WriteTableData(ctx context.Context, ir TableDataIR) error {
-	log.Debug("start dumping table...", zap.String("table", ir.TableName()))
-
-	// just let `database.table.sql` be `database.table.0.sql`
-	/*if fileName == "" {
-		// set initial file name
-		fileName = fmt.Sprintf("%s.%s.sql", ir.DatabaseName(), ir.TableName())
-		if f.cfg.FileSize != UnspecifiedSize {
-			fileName = fmt.Sprintf("%s.%s.%d.sql", ir.DatabaseName(), ir.TableName(), 0)
+func (f *FileWriter) WriteTableData(ctx context.Context, meta TableMeta, irStream <-chan TableDataIR) error {
+	if irStream == nil {
+		return nil
+	}
+	log.Debug("start dumping table...",
+		zap.String("table", meta.TableName()),
+		zap.Stringer("format", f.fileFmt))
+	chunkIndex := 0
+	channelClosed := false
+	for !channelClosed {
+		select {
+		case <-ctx.Done():
+			log.Info("context has been done",
+				zap.String("table", meta.TableName()),
+				zap.Stringer("format", f.fileFmt))
+			return nil
+		case ir, ok := <-irStream:
+			if !ok {
+				channelClosed = true
+				break
+			}
+			conn := f.cntPool.getConn()
+			err := ir.Start(ctx, conn)
+			if err != nil {
+				return err
+			}
+			err = f.writeTableData(ctx, meta, ir, chunkIndex)
+			if err != nil {
+				f.cntPool.releaseConn(conn)
+				return err
+			}
+			chunkIndex++
+			f.cntPool.releaseConn(conn)
 		}
-	}*/
-	namer := newOutputFileNamer(ir)
-	fileName, err := namer.NextName(f.cfg.OutputFileTemplate)
+	}
+	log.Debug("dumping table successfully",
+		zap.String("table", meta.TableName()))
+	return nil
+}
+
+func (f *FileWriter) writeTableData(ctx context.Context, meta TableMeta, ir TableDataIR, curChkIdx int) error {
+	conf, format := f.cfg, f.fileFmt
+	namer := newOutputFileNamer(meta, curChkIdx)
+	fileName, err := namer.NextName(conf.OutputFileTemplate)
 	if err != nil {
 		return err
 	}
-	fileName += ".sql"
-	chunksIter := ir
-	defer chunksIter.Rows().Close()
+	fileName += format.Extension()
 
 	for {
-		fileWriter, tearDown := buildInterceptFileWriter(f.cfg.ExternalStorage, fileName)
-		err = WriteInsert(ctx, chunksIter, fileWriter, f.cfg.FileSize, f.cfg.StatementSize)
+		fileWriter, tearDown := buildInterceptFileWriter(f.extStorage, fileName)
+		err = format.WriteInsert(ctx, conf, meta, ir, fileWriter)
 		tearDown(ctx)
 		if err != nil {
 			return err
@@ -93,22 +134,21 @@ func (f SQLWriter) WriteTableData(ctx context.Context, ir TableDataIR) error {
 			break
 		}
 
-		if f.cfg.FileSize == UnspecifiedSize {
+		if conf.FileSize == UnspecifiedSize {
 			break
 		}
-		fileName, err = namer.NextName(f.cfg.OutputFileTemplate)
+		fileName, err = namer.NextName(conf.OutputFileTemplate)
 		if err != nil {
 			return err
 		}
-		fileName += ".sql"
+		fileName += format.Extension()
 	}
-	log.Debug("dumping table successfully",
-		zap.String("table", ir.TableName()))
-	return nil
+
+	return ir.Rows().Close()
 }
 
-func writeMetaToFile(ctx context.Context, target, metaSQL string, s storage.ExternalStorage, path string) error {
-	fileWriter, tearDown, err := buildFileWriter(ctx, s, path)
+func (f *FileWriter) writeMetaToFile(ctx context.Context, target, metaSQL string, path string) error {
+	fileWriter, tearDown, err := buildFileWriter(ctx, f.extStorage, path)
 	if err != nil {
 		return err
 	}
@@ -123,8 +163,6 @@ func writeMetaToFile(ctx context.Context, target, metaSQL string, s storage.Exte
 	}, fileWriter)
 }
 
-type CSVWriter struct{ SimpleWriter }
-
 type outputFileNamer struct {
 	Index int
 	DB    string
@@ -137,9 +175,9 @@ type csvOption struct {
 	delimiter []byte
 }
 
-func newOutputFileNamer(ir TableDataIR) *outputFileNamer {
+func newOutputFileNamer(ir TableMeta, chunkIndex int) *outputFileNamer {
 	return &outputFileNamer{
-		Index: ir.ChunkIndex(),
+		Index: chunkIndex,
 		DB:    ir.DatabaseName(),
 		Table: ir.TableName(),
 	}
@@ -157,48 +195,4 @@ func (namer *outputFileNamer) NextName(tmpl *template.Template) (string, error) 
 	res, err := namer.render(tmpl, outputFileTemplateData)
 	namer.Index++
 	return res, err
-}
-
-func (f CSVWriter) WriteTableData(ctx context.Context, ir TableDataIR) error {
-	log.Debug("start dumping table in csv format...", zap.String("table", ir.TableName()))
-
-	namer := newOutputFileNamer(ir)
-	fileName, err := namer.NextName(f.cfg.OutputFileTemplate)
-	if err != nil {
-		return err
-	}
-	fileName += ".csv"
-	chunksIter := ir
-	defer chunksIter.Rows().Close()
-
-	opt := &csvOption{
-		nullValue: f.cfg.CsvNullValue,
-		separator: []byte(f.cfg.CsvSeparator),
-		delimiter: []byte(f.cfg.CsvDelimiter),
-	}
-
-	for {
-		fileWriter, tearDown := buildInterceptFileWriter(f.cfg.ExternalStorage, fileName)
-		err = WriteInsertInCsv(ctx, chunksIter, fileWriter, f.cfg.NoHeader, opt, f.cfg.FileSize)
-		tearDown(ctx)
-		if err != nil {
-			return err
-		}
-
-		if w, ok := fileWriter.(*InterceptFileWriter); ok && !w.SomethingIsWritten {
-			break
-		}
-
-		if f.cfg.FileSize == UnspecifiedSize {
-			break
-		}
-		fileName, err = namer.NextName(f.cfg.OutputFileTemplate)
-		if err != nil {
-			return err
-		}
-		fileName += ".csv"
-	}
-	log.Debug("dumping table in csv format successfully",
-		zap.String("table", ir.TableName()))
-	return nil
 }

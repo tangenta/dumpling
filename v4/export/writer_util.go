@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"strings"
 	"sync"
 
@@ -118,7 +117,7 @@ func WriteMeta(ctx context.Context, meta MetaIR, w storage.Writer) error {
 	return nil
 }
 
-func WriteInsert(pCtx context.Context, tblIR TableDataIR, w storage.Writer, fileSizeLimit, statementSizeLimit uint64) error {
+func WriteInsert(pCtx context.Context, cfg *Config, meta TableMeta, tblIR TableDataIR, w storage.Writer) error {
 	fileRowIter := tblIR.Rows()
 	if !fileRowIter.HasNext() {
 		return nil
@@ -129,7 +128,7 @@ func WriteInsert(pCtx context.Context, tblIR TableDataIR, w storage.Writer, file
 		bf.Grow(lengthLimit - bfCap)
 	}
 
-	wp := newWriterPipe(w, fileSizeLimit, statementSizeLimit)
+	wp := newWriterPipe(w, cfg.FileSize, cfg.StatementSize)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
@@ -143,7 +142,7 @@ func WriteInsert(pCtx context.Context, tblIR TableDataIR, w storage.Writer, file
 		wg.Wait()
 	}()
 
-	specCmtIter := tblIR.SpecialComments()
+	specCmtIter := meta.SpecialComments()
 	for specCmtIter.HasNext() {
 		bf.WriteString(specCmtIter.Next())
 		bf.WriteByte('\n')
@@ -152,20 +151,20 @@ func WriteInsert(pCtx context.Context, tblIR TableDataIR, w storage.Writer, file
 
 	var (
 		insertStatementPrefix string
-		row                   = MakeRowReceiver(tblIR.ColumnTypes())
+		row                   = MakeRowReceiver(meta.ColumnTypes())
 		counter               = 0
-		escapeBackSlash       = tblIR.EscapeBackSlash()
+		escapeBackSlash       = cfg.EscapeBackslash
 		err                   error
 	)
 
-	selectedField := tblIR.SelectedField()
+	selectedField := meta.SelectedField()
 	// if has generated column
 	if selectedField != "" {
 		insertStatementPrefix = fmt.Sprintf("INSERT INTO %s %s VALUES\n",
-			wrapBackTicks(escapeString(tblIR.TableName())), selectedField)
+			wrapBackTicks(escapeString(meta.TableName())), selectedField)
 	} else {
 		insertStatementPrefix = fmt.Sprintf("INSERT INTO %s VALUES\n",
-			wrapBackTicks(escapeString(tblIR.TableName())))
+			wrapBackTicks(escapeString(meta.TableName())))
 	}
 	insertStatementPrefixLen := uint64(len(insertStatementPrefix))
 
@@ -217,7 +216,7 @@ func WriteInsert(pCtx context.Context, tblIR TableDataIR, w storage.Writer, file
 		}
 	}
 	log.Debug("dumping table",
-		zap.String("table", tblIR.TableName()),
+		zap.String("table", meta.TableName()),
 		zap.Int("record counts", counter))
 	if bf.Len() > 0 {
 		wp.input <- bf
@@ -230,7 +229,13 @@ func WriteInsert(pCtx context.Context, tblIR TableDataIR, w storage.Writer, file
 	return wp.Error()
 }
 
-func WriteInsertInCsv(pCtx context.Context, tblIR TableDataIR, w storage.Writer, noHeader bool, opt *csvOption, fileSizeLimit uint64) error {
+func WriteInsertInCsv(pCtx context.Context, cfg *Config, meta TableMeta, tblIR TableDataIR, w storage.Writer) error {
+	opt := &csvOption{
+		nullValue: cfg.CsvNullValue,
+		separator: []byte(cfg.CsvSeparator),
+		delimiter: []byte(cfg.CsvDelimiter),
+	}
+
 	fileRowIter := tblIR.Rows()
 	if !fileRowIter.HasNext() {
 		return nil
@@ -241,7 +246,7 @@ func WriteInsertInCsv(pCtx context.Context, tblIR TableDataIR, w storage.Writer,
 		bf.Grow(lengthLimit - bfCap)
 	}
 
-	wp := newWriterPipe(w, fileSizeLimit, UnspecifiedSize)
+	wp := newWriterPipe(w, cfg.FileSize, UnspecifiedSize)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
@@ -256,18 +261,18 @@ func WriteInsertInCsv(pCtx context.Context, tblIR TableDataIR, w storage.Writer,
 	}()
 
 	var (
-		row             = MakeRowReceiver(tblIR.ColumnTypes())
+		row             = MakeRowReceiver(meta.ColumnTypes())
 		counter         = 0
-		escapeBackSlash = tblIR.EscapeBackSlash()
+		escapeBackSlash = cfg.EscapeBackslash
 		err             error
 	)
 
-	if !noHeader && len(tblIR.ColumnNames()) != 0 {
-		for i, col := range tblIR.ColumnNames() {
+	if !cfg.NoHeader && len(meta.ColumnNames()) != 0 {
+		for i, col := range meta.ColumnNames() {
 			bf.Write(opt.delimiter)
 			escape([]byte(col), bf, getEscapeQuotation(escapeBackSlash, opt.delimiter))
 			bf.Write(opt.delimiter)
-			if i != len(tblIR.ColumnTypes())-1 {
+			if i != len(meta.ColumnTypes())-1 {
 				bf.Write(opt.separator)
 			}
 		}
@@ -309,7 +314,7 @@ func WriteInsertInCsv(pCtx context.Context, tblIR TableDataIR, w storage.Writer,
 	}
 
 	log.Debug("dumping table",
-		zap.String("table", tblIR.TableName()),
+		zap.String("table", meta.TableName()),
 		zap.Int("record counts", counter))
 	if bf.Len() > 0 {
 		wp.input <- bf
@@ -409,21 +414,6 @@ func buildInterceptFileWriter(s storage.ExternalStorage, path string) (storage.W
 	return fileWriter, tearDownRoutine
 }
 
-type LazyStringWriter struct {
-	initRoutine func() error
-	sync.Once
-	io.StringWriter
-	err error
-}
-
-func (l *LazyStringWriter) WriteString(str string) (int, error) {
-	l.Do(func() { l.err = l.initRoutine() })
-	if l.err != nil {
-		return 0, fmt.Errorf("open file error: %s", l.err.Error())
-	}
-	return l.StringWriter.WriteString(str)
-}
-
 // InterceptFileWriter is an interceptor of os.File,
 // tracking whether a StringWriter has written something.
 type InterceptFileWriter struct {
@@ -459,4 +449,50 @@ func wrapBackTicks(identifier string) string {
 
 func wrapStringWith(str string, wrapper string) string {
 	return fmt.Sprintf("%s%s%s", wrapper, str, wrapper)
+}
+
+// FileFormat is the format that output to file. Currently we support SQL text and CSV file format.
+type FileFormat int32
+
+const (
+	FileFormatSQLText FileFormat = iota
+	FileFormatCSV
+)
+
+// String implement Stringer.String method.
+func (f FileFormat) String() string {
+	switch f {
+	case FileFormatSQLText:
+		return "text"
+	case FileFormatCSV:
+		return "CSV"
+	default:
+		return "unknown"
+	}
+}
+
+// Extension returns the extension for specific format.
+//  text -> ".sql"
+//  csv  -> ".csv"
+func (f FileFormat) Extension() string {
+	switch f {
+	case FileFormatSQLText:
+		return ".sql"
+	case FileFormatCSV:
+		return ".csv"
+	default:
+		return ".unknown_format"
+	}
+}
+
+func (f FileFormat) WriteInsert(pCtx context.Context, cfg *Config, meta TableMeta, tblIR TableDataIR, w storage.Writer) error {
+	switch f {
+	case FileFormatSQLText:
+		return WriteInsert(pCtx, cfg, meta, tblIR, w)
+	case FileFormatCSV:
+		return WriteInsertInCsv(pCtx, cfg, meta, tblIR, w)
+	default:
+		log.Warn("unknown file format", zap.Int32("FileFormat", int32(f)))
+		return nil
+	}
 }

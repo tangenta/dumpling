@@ -2,7 +2,10 @@ package export
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/pingcap/br/pkg/storage"
 	"io/ioutil"
 	"os"
 	"path"
@@ -12,19 +15,47 @@ import (
 
 var _ = Suite(&testWriterSuite{})
 
-type testWriterSuite struct{}
+type testWriterSuite struct {
+	pool *connectionsPool
+}
 
-func (s *testDumpSuite) TestWriteDatabaseMeta(c *C) {
+func (s *testWriterSuite) SetUpSuite(c *C) {
+	s.pool = newMockConnectPool(c)
+}
+
+func (s *testWriterSuite) TearDownSuite(c *C) {
+	c.Assert(s.pool.Close(), IsNil)
+}
+
+func newMockConnectPool(c *C) *connectionsPool {
+	db, _, err := sqlmock.New()
+	c.Assert(err, IsNil)
+	conn, err := db.Conn(context.Background())
+	c.Assert(err, IsNil)
+	connectPool := &connectionsPool{conns: make(chan *sql.Conn, 1)}
+	connectPool.releaseConn(conn)
+	connectPool.createdConns = []*sql.Conn{conn}
+	return connectPool
+}
+
+func (t *testWriterSuite) newFileWriter(conf *Config, c *C) *FileWriter {
+	b, err := storage.ParseBackend(conf.OutputDirPath, &conf.BackendOptions)
+	c.Assert(err, IsNil)
+	extStore, err := storage.Create(context.Background(), b, false)
+	c.Assert(err, IsNil)
+	return NewFileWriter(conf, t.pool, extStore)
+}
+
+func (s *testWriterSuite) TestWriteDatabaseMeta(c *C) {
 	dir := c.MkDir()
 	ctx := context.Background()
 
 	config := DefaultConfig()
 	config.OutputDirPath = dir
-	err := adjustConfig(ctx, config)
+	err := NewConfigResolver(ctx).ResolveConfig(config)
 	c.Assert(err, IsNil)
 
-	writer, err := NewSimpleWriter(config)
-	c.Assert(err, IsNil)
+	writer := s.newFileWriter(config, c)
 	err = writer.WriteDatabaseMeta(ctx, "test", "CREATE DATABASE `test`")
 	c.Assert(err, IsNil)
 	p := path.Join(dir, "test-schema-create.sql")
@@ -35,17 +66,16 @@ func (s *testDumpSuite) TestWriteDatabaseMeta(c *C) {
 	c.Assert(string(bytes), Equals, "/*!40101 SET NAMES binary*/;\nCREATE DATABASE `test`;\n")
 }
 
-func (s *testDumpSuite) TestWriteTableMeta(c *C) {
+func (s *testWriterSuite) TestWriteTableMeta(c *C) {
 	dir := c.MkDir()
 	ctx := context.Background()
 
 	config := DefaultConfig()
 	config.OutputDirPath = dir
-	err := adjustConfig(ctx, config)
+	err := NewConfigResolver(ctx).ResolveConfig(config)
 	c.Assert(err, IsNil)
 
-	writer, err := NewSimpleWriter(config)
-	c.Assert(err, IsNil)
+	writer := s.newFileWriter(config, c)
 	err = writer.WriteTableMeta(ctx, "test", "t", "CREATE TABLE t (a INT)")
 	c.Assert(err, IsNil)
 	p := path.Join(dir, "test.t-schema.sql")
@@ -56,17 +86,16 @@ func (s *testDumpSuite) TestWriteTableMeta(c *C) {
 	c.Assert(string(bytes), Equals, "/*!40101 SET NAMES binary*/;\nCREATE TABLE t (a INT);\n")
 }
 
-func (s *testDumpSuite) TestWriteViewMeta(c *C) {
+func (s *testWriterSuite) TestWriteViewMeta(c *C) {
 	dir := c.MkDir()
 	ctx := context.Background()
 
 	config := DefaultConfig()
 	config.OutputDirPath = dir
-	err := adjustConfig(ctx, config)
+	err := NewConfigResolver(ctx).ResolveConfig(config)
 	c.Assert(err, IsNil)
 
-	writer, err := NewSimpleWriter(config)
-	c.Assert(err, IsNil)
+	writer := s.newFileWriter(config, c)
 	specCmt := "/*!40101 SET NAMES binary*/;\n"
 	createTableSQL := "CREATE TABLE `v`(\n`a` int\n)ENGINE=MyISAM;\n"
 	createViewSQL := "DROP TABLE IF EXISTS `v`;\nDROP VIEW IF EXISTS `v`;\nSET @PREV_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT;\nSET @PREV_CHARACTER_SET_RESULTS=@@CHARACTER_SET_RESULTS;\nSET @PREV_COLLATION_CONNECTION=@@COLLATION_CONNECTION;\nSET character_set_client = utf8;\nSET character_set_results = utf8;\nSET collation_connection = utf8_general_ci;\nCREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `v` (`a`) AS SELECT `t`.`a` AS `a` FROM `test`.`t`;\nSET character_set_client = @PREV_CHARACTER_SET_CLIENT;\nSET character_set_results = @PREV_CHARACTER_SET_RESULTS;\nSET collation_connection = @PREV_COLLATION_CONNECTION;\n"
@@ -88,19 +117,17 @@ func (s *testDumpSuite) TestWriteViewMeta(c *C) {
 	c.Assert(string(bytes), Equals, specCmt+createViewSQL)
 }
 
-func (s *testDumpSuite) TestWriteTableData(c *C) {
+func (s *testWriterSuite) TestWriteTableData(c *C) {
 	dir := c.MkDir()
 
 	ctx := context.Background()
 
 	config := DefaultConfig()
 	config.OutputDirPath = dir
-	err := adjustConfig(ctx, config)
+	err := NewConfigResolver(ctx).ResolveConfig(config)
 	c.Assert(err, IsNil)
 
-	simpleWriter, err := NewSimpleWriter(config)
-	c.Assert(err, IsNil)
-	writer := SQLWriter{SimpleWriter: simpleWriter}
+	writer := s.newFileWriter(config, c)
 
 	data := [][]driver.Value{
 		{"1", "male", "bob@mail.com", "020-1234", nil},
@@ -114,7 +141,7 @@ func (s *testDumpSuite) TestWriteTableData(c *C) {
 		"/*!40014 SET FOREIGN_KEY_CHECKS=0*/;",
 	}
 	tableIR := newMockTableIR("test", "employee", data, specCmts, colTypes)
-	err = writer.WriteTableData(ctx, tableIR)
+	err = writer.WriteTableData(ctx, tableIR, makeOneTimeChan(tableIR))
 	c.Assert(err, IsNil)
 
 	p := path.Join(dir, "test.employee.0.sql")
@@ -133,7 +160,7 @@ func (s *testDumpSuite) TestWriteTableData(c *C) {
 	c.Assert(string(bytes), Equals, expected)
 }
 
-func (s *testDumpSuite) TestWriteTableDataWithFileSize(c *C) {
+func (s *testWriterSuite) TestWriteTableDataWithFileSize(c *C) {
 	dir := c.MkDir()
 
 	ctx := context.Background()
@@ -141,7 +168,7 @@ func (s *testDumpSuite) TestWriteTableDataWithFileSize(c *C) {
 	config := DefaultConfig()
 	config.OutputDirPath = dir
 	config.FileSize = 50
-	err := adjustConfig(ctx, config)
+	err := NewConfigResolver(ctx).ResolveConfig(config)
 	c.Assert(err, IsNil)
 	specCmts := []string{
 		"/*!40101 SET NAMES binary*/;",
@@ -151,9 +178,7 @@ func (s *testDumpSuite) TestWriteTableDataWithFileSize(c *C) {
 	config.FileSize += uint64(len(specCmts[1]) + 1)
 	config.FileSize += uint64(len("INSERT INTO `employees` VALUES\n"))
 
-	simpleWriter, err := NewSimpleWriter(config)
-	c.Assert(err, IsNil)
-	writer := SQLWriter{SimpleWriter: simpleWriter}
+	writer := s.newFileWriter(config, c)
 
 	data := [][]driver.Value{
 		{"1", "male", "bob@mail.com", "020-1234", nil},
@@ -163,7 +188,7 @@ func (s *testDumpSuite) TestWriteTableDataWithFileSize(c *C) {
 	}
 	colTypes := []string{"INT", "SET", "VARCHAR", "VARCHAR", "TEXT"}
 	tableIR := newMockTableIR("test", "employee", data, specCmts, colTypes)
-	err = writer.WriteTableData(ctx, tableIR)
+	err = writer.WriteTableData(ctx, tableIR, makeOneTimeChan(tableIR))
 	c.Assert(err, IsNil)
 
 	cases := map[string]string{
@@ -189,7 +214,7 @@ func (s *testDumpSuite) TestWriteTableDataWithFileSize(c *C) {
 	}
 }
 
-func (s *testDumpSuite) TestWriteTableDataWithStatementSize(c *C) {
+func (s *testWriterSuite) TestWriteTableDataWithStatementSize(c *C) {
 	dir := c.MkDir()
 
 	ctx := context.Background()
@@ -201,12 +226,10 @@ func (s *testDumpSuite) TestWriteTableDataWithStatementSize(c *C) {
 	var err error
 	config.OutputFileTemplate, err = ParseOutputFileTemplate("specified-name")
 	c.Assert(err, IsNil)
-	err = adjustConfig(ctx, config)
+	err = NewConfigResolver(ctx).ResolveConfig(config)
 	c.Assert(err, IsNil)
 
-	simpleWriter, err := NewSimpleWriter(config)
-	c.Assert(err, IsNil)
-	writer := SQLWriter{SimpleWriter: simpleWriter}
+	writer := s.newFileWriter(config, c)
 
 	data := [][]driver.Value{
 		{"1", "male", "bob@mail.com", "020-1234", nil},
@@ -220,7 +243,7 @@ func (s *testDumpSuite) TestWriteTableDataWithStatementSize(c *C) {
 		"/*!40014 SET FOREIGN_KEY_CHECKS=0*/;",
 	}
 	tableIR := newMockTableIR("te%/st", "employee", data, specCmts, colTypes)
-	err = writer.WriteTableData(ctx, tableIR)
+	err = writer.WriteTableData(ctx, tableIR, makeOneTimeChan(tableIR))
 	c.Assert(err, IsNil)
 
 	// only with statement size
@@ -255,9 +278,11 @@ func (s *testDumpSuite) TestWriteTableDataWithStatementSize(c *C) {
 	c.Assert(err, IsNil)
 	os.RemoveAll(config.OutputDirPath)
 	config.OutputDirPath, err = ioutil.TempDir("", "dumpling")
-	newStorage, err := config.createExternalStorage(context.Background())
 	c.Assert(err, IsNil)
-	config.ExternalStorage = newStorage
+	err = NewConfigResolver(ctx).ResolveConfig(config)
+	c.Assert(err, IsNil)
+
+	writer = s.newFileWriter(config, c)
 
 	cases = map[string]string{
 		"0-employee-te%25%2Fst.sql": "/*!40101 SET NAMES binary*/;\n" +
@@ -274,7 +299,7 @@ func (s *testDumpSuite) TestWriteTableDataWithStatementSize(c *C) {
 	}
 
 	tableIR = newMockTableIR("te%/st", "employee", data, specCmts, colTypes)
-	c.Assert(writer.WriteTableData(ctx, tableIR), IsNil)
+	err = writer.WriteTableData(ctx, tableIR, makeOneTimeChan(tableIR))
 	c.Assert(err, IsNil)
 	for p, expected := range cases {
 		p := path.Join(config.OutputDirPath, p)
